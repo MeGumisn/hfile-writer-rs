@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1.50.0",features = ["full"] }
 bytes = "1.11.1"
+utctimestamp = "0.1.4"
+bstr = "1.12.1"
+crc32c = "0.6.8"
