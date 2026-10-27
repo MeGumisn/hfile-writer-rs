@@ -2,15 +2,53 @@
 name = "hfile-writer-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Read and write Apache HBase HFile v3 files, with Arrow <-> HFile conversion"
+license = "Apache-2.0"
+readme = "README.md"
 
 [dependencies]
-tokio = { version = "1.50.0",features = ["full"] }
-bytes = "1.11.1"
-prost = "0.14.3"
-utctimestamp = "0.1.4"
-bstr = "1.12.1"
-crc32c = "0.6.8"
-integer-encoding="4.1.0"
+# HFile wire format
+prost = "0.14"
+crc32c = "0.6"
+crc32fast = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# serialization for Arrow schema / mapping config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# error handling
+
+# block compression (HBase codec ordinals: NONE=2, GZ=1, BZIP2=5, ZSTD=6)
+flate2 = "1"
+zstd = "0.13"
+
+# Arrow / Parquet interop
+arrow-array = "60"
+arrow-schema = { version = "60", features = ["serde"] }
+arrow-select = "60"
+arrow-cast = "60"
+parquet = { version = "60", default-features = false, features = [
+    "arrow",
+    "snap",
+    "flate2",
+    "flate2-rust_backend",
+    "zstd",
+] }
 
 [build-dependencies]
-prost-build = "0.14.3"
+prost-build = "0.14"
+protox = "0.10"
+
+[lib]
+name = "hfile_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hfile"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
