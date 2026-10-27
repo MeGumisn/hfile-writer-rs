@@ -2,7 +2,10 @@
 //!
 //! ```text
 //! hfile info <file.hfile> [--dump] [--limit N]
-//! hfile arrow2hfile <input.parquet> --out <file.hfile> [--family cf] [--row-key id]
+//! hfile dump <file.hfile>
+//! hfile bloom <file.hfile> <row>...          # bloom filter membership, `hex:aabb` for binary rows
+//! hfile meta <file.hfile> <name>             # payload of one meta block
+//! hfile arrow2hfile <input.parquet> --out <file.hfile> [--family cf] [--bloom ROW] [--meta N=V]
 //! hfile hfile2arrow <file.hfile> --out <output.parquet> [--schema schema.json]
 //! hfile arrow2bulkload <input.parquet> --dir <bulkdir> --family cf
 //! ```
@@ -13,6 +16,7 @@ use hfile_rs::arrow::write::{load_schema, parquet_to_hfile, save_schema, source_
 use hfile_rs::arrow::{Mapping, ValueEncoding};
 use hfile_rs::error::{HFileError, Result};
 use hfile_rs::hbase::block::DEFAULT_BLOCK_SIZE;
+use hfile_rs::hbase::bloom::{BloomOptions, BloomType, DEFAULT_ERROR_RATE};
 use hfile_rs::hbase::compression::{Compression, ZstdFraming};
 use hfile_rs::hbase::encoding::DataBlockEncoding;
 use hfile_rs::hbase::reader::HFileReader;
@@ -53,6 +57,22 @@ enum Command {
         path: PathBuf,
     },
 
+    /// Ask the bloom filter which of the given rows may be in the file.
+    Bloom {
+        /// Path of the HFile.
+        path: PathBuf,
+        /// Rows to test; printed as `<row> maybe|no`.
+        rows: Vec<String>,
+    },
+
+    /// Print a meta block by name.
+    Meta {
+        /// Path of the HFile.
+        path: PathBuf,
+        /// Meta block to print.
+        name: String,
+    },
+
     /// Convert a Parquet file into an HFile.
     Arrow2hfile(Box<ArrowToHFileArgs>),
 
@@ -91,12 +111,21 @@ struct ArrowToHFileArgs {
     /// Data block encoding: NONE, PREFIX or ROW_INDEX_V1.
     #[arg(long, default_value = "NONE")]
     encoding: String,
-    /// Block compression: none, gz or zstd.
+    /// Block compression: none, gz, snappy or zstd.
     #[arg(long, default_value = "none")]
     codec: String,
     /// zstd payload framing: raw (Hadoop `ZStandardCodec`) or hbase (`hbase-compression-zstd`).
     #[arg(long, default_value = "raw")]
     zstd_framing: String,
+    /// Bloom filter type: none or ROW.
+    #[arg(long, default_value = "none")]
+    bloom: String,
+    /// Bloom filter false positive rate (HBase `io.storefile.bloom.error.rate`).
+    #[arg(long)]
+    bloom_error_rate: Option<f32>,
+    /// Meta block to add, as `NAME=VALUE`; repeatable.
+    #[arg(long, value_name = "NAME=VALUE")]
+    meta: Vec<String>,
     /// Target data block size in bytes.
     #[arg(long)]
     block_size: Option<usize>,
@@ -173,6 +202,15 @@ struct BulkLoadArgs {
     codec: String,
     #[arg(long, default_value = "raw")]
     zstd_framing: String,
+    /// Bloom filter type: none or ROW.
+    #[arg(long, default_value = "none")]
+    bloom: String,
+    /// Bloom filter false positive rate (HBase `io.storefile.bloom.error.rate`).
+    #[arg(long)]
+    bloom_error_rate: Option<f32>,
+    /// Meta block to add, as `NAME=VALUE`; repeatable.
+    #[arg(long, value_name = "NAME=VALUE")]
+    meta: Vec<String>,
     #[arg(long)]
     block_size: Option<usize>,
 }
@@ -194,6 +232,8 @@ fn run() -> Result<()> {
             no_checksum,
         } => info(&path, dump, limit, no_checksum),
         Command::Dump { path } => dump(&path),
+        Command::Bloom { path, rows } => bloom(&path, &rows),
+        Command::Meta { path, name } => meta_block(&path, &name),
         Command::Arrow2hfile(args) => arrow2hfile(*args),
         Command::Hfile2arrow(args) => hfile2arrow(*args),
         Command::Arrow2bulkload(args) => arrow2bulkload(*args),
@@ -230,6 +270,78 @@ fn dump(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// `hfile bloom`: consult the bloom filter, printed as `<row> maybe|no`.
+fn bloom(path: &std::path::Path, rows: &[String]) -> Result<()> {
+    let reader = HFileReader::open(path)?;
+    match reader.bloom_filter() {
+        Some(filter) => eprintln!(
+            "bloom: {} chunks, {} bytes, {} hash functions, {} keys",
+            filter.chunks.len(),
+            filter.byte_size(),
+            filter.hash_count,
+            filter.total_key_count
+        ),
+        None => eprintln!("bloom: none in this file, every row answers 'maybe'"),
+    }
+    for row in rows {
+        let answer = if reader.may_contain_row(&row_bytes(row)?)? {
+            "maybe"
+        } else {
+            "no"
+        };
+        println!("{row} {answer}");
+    }
+    Ok(())
+}
+
+/// Row keys are arbitrary bytes; `hex:aabb` spells the ones that are not printable.
+fn row_bytes(spec: &str) -> Result<Vec<u8>> {
+    let Some(digits) = spec.strip_prefix("hex:") else {
+        return Ok(spec.as_bytes().to_vec());
+    };
+    if digits.len() % 2 != 0 {
+        return Err(HFileError::InvalidArgument(format!(
+            "row '{spec}' has an odd number of hex digits"
+        )));
+    }
+    digits
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair)
+                .map_err(|_| HFileError::InvalidArgument(format!("row '{spec}' is not hex")))?;
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| HFileError::InvalidArgument(format!("row '{spec}' is not hex")))
+        })
+        .collect()
+}
+
+/// `hfile meta`: print a meta block, hex when it is not valid UTF-8.
+fn meta_block(path: &std::path::Path, name: &str) -> Result<()> {
+    let reader = HFileReader::open(path)?;
+    let names: Vec<String> = reader
+        .meta_block_names()
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .collect();
+    match reader.meta_block(name.as_bytes())? {
+        Some(payload) => {
+            if payload
+                .iter()
+                .all(|b| b.is_ascii_graphic() || matches!(b, b'\n' | b'\r' | b'\t' | b' '))
+            {
+                println!("{}", String::from_utf8_lossy(&payload));
+            } else {
+                println!("{}", hex(&payload));
+            }
+            Ok(())
+        }
+        None => {
+            eprintln!("no meta block '{name}'; the file has: {names:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn info(path: &std::path::Path, dump: bool, limit: usize, no_checksum: bool) -> Result<()> {
     let reader = HFileReader::open_with_options(
         path,
@@ -250,13 +362,19 @@ fn info(path: &std::path::Path, dump: bool, limit: usize, no_checksum: bool) -> 
         reader.compression().name(),
         trailer.compression_codec
     );
-    println!("data block encoding: {}", reader.data_block_encoding().name());
+    println!(
+        "data block encoding: {}",
+        reader.data_block_encoding().name()
+    );
     println!("entries: {}", reader.entry_count());
     println!("data blocks: {}", reader.data_block_count());
     println!("index levels: {}", trailer.num_data_index_levels);
     println!("data index count: {}", trailer.data_index_count);
     println!("meta index count: {}", trailer.meta_index_count);
-    println!("first data block offset: {}", trailer.first_data_block_offset);
+    println!(
+        "first data block offset: {}",
+        trailer.first_data_block_offset
+    );
     println!("last data block offset: {}", trailer.last_data_block_offset);
     println!("file info offset: {}", trailer.file_info_offset);
     println!("load on open offset: {}", trailer.load_on_open_data_offset);
@@ -270,14 +388,37 @@ fn info(path: &std::path::Path, dump: bool, limit: usize, no_checksum: bool) -> 
     );
     println!("includes tags: {}", reader.includes_tags());
     println!("includes mvcc: {}", reader.includes_mvcc());
+    match reader.bloom_filter() {
+        Some(filter) => println!(
+            "bloom filter: {} ({} chunks, {} bytes, {} hash functions, {} keys)",
+            reader
+                .file_info()
+                .bloom_filter_type()
+                .unwrap_or_else(|| "ROW".into()),
+            filter.chunks.len(),
+            filter.byte_size(),
+            filter.hash_count,
+            filter.total_key_count
+        ),
+        None => println!(
+            "bloom filter: none{}",
+            reader
+                .file_info()
+                .bloom_filter_type()
+                .map(|t| format!(" (file info says {t})"))
+                .unwrap_or_default()
+        ),
+    }
+    let meta_names: Vec<String> = reader
+        .meta_block_names()
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .collect();
+    println!("meta blocks: {meta_names:?}");
     println!("file info:");
     for (key, value) in reader.file_info().iter() {
         let key = String::from_utf8_lossy(key);
         if value.len() <= 64 && value.iter().all(|b| b.is_ascii_graphic()) {
-            println!(
-                "  {key} = {:?}",
-                String::from_utf8_lossy(value).to_string()
-            );
+            println!("  {key} = {:?}", String::from_utf8_lossy(value).to_string());
         } else if value.len() == 4 {
             let mut raw = [0u8; 4];
             raw.copy_from_slice(value);
@@ -349,12 +490,31 @@ fn build_writer_options(
     encoding: &str,
     codec: &str,
     zstd_framing: &str,
+    bloom: &str,
+    bloom_error_rate: Option<f32>,
+    meta: &[String],
     block_size: Option<usize>,
 ) -> Result<WriterOptions> {
+    let bloom_filter = match BloomType::parse_name(bloom)? {
+        BloomType::None => None,
+        BloomType::Row => Some(BloomOptions {
+            error_rate: bloom_error_rate.unwrap_or(DEFAULT_ERROR_RATE),
+            ..Default::default()
+        }),
+    };
+    let mut meta_blocks = Vec::with_capacity(meta.len());
+    for spec in meta {
+        let (name, value) = spec.split_once('=').ok_or_else(|| {
+            HFileError::InvalidArgument(format!("--meta expects NAME=VALUE, got '{spec}'"))
+        })?;
+        meta_blocks.push((name.to_string(), value.as_bytes().to_vec()));
+    }
     Ok(WriterOptions {
         encoding: DataBlockEncoding::parse_name(encoding)?,
         compression: Compression::parse_name(codec)?,
         zstd_framing: ZstdFraming::parse_name(zstd_framing)?,
+        bloom_filter,
+        meta_blocks,
         block_size: block_size.unwrap_or(DEFAULT_BLOCK_SIZE),
         ..Default::default()
     })
@@ -373,6 +533,9 @@ fn arrow2hfile(args: ArrowToHFileArgs) -> Result<()> {
         &args.encoding,
         &args.codec,
         &args.zstd_framing,
+        &args.bloom,
+        args.bloom_error_rate,
+        &args.meta,
         args.block_size,
     )?;
     let stats = parquet_to_hfile(&args.input, &args.out, &mapping, options)?;
@@ -387,8 +550,12 @@ fn arrow2hfile(args: ArrowToHFileArgs) -> Result<()> {
         stats.rows,
         args.out.display(),
         DataBlockEncoding::parse_name(&args.encoding)?.name(),
-        stats.first_row_key.map(|k| String::from_utf8_lossy(&k).to_string()),
-        stats.last_row_key.map(|k| String::from_utf8_lossy(&k).to_string())
+        stats
+            .first_row_key
+            .map(|k| String::from_utf8_lossy(&k).to_string()),
+        stats
+            .last_row_key
+            .map(|k| String::from_utf8_lossy(&k).to_string())
     );
     Ok(())
 }
@@ -447,6 +614,9 @@ fn arrow2bulkload(args: BulkLoadArgs) -> Result<()> {
         &args.encoding,
         &args.codec,
         &args.zstd_framing,
+        &args.bloom,
+        args.bloom_error_rate,
+        &args.meta,
         args.block_size,
     )?;
 

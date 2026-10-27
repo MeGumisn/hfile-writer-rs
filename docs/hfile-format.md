@@ -10,15 +10,21 @@ This is the subset of the HBase HFile format that this crate implements. Field n
 ```text
 offset 0                       first data block            "DATABLK*" / "DATABLKE"
         ...                    more data blocks            chained through prevBlockOffset
+        ...                    bloom chunk blocks          "BLMFBLK2"
+        ...                    meta blocks                 "METABLKc"
 last_data_block_offset         (last data block)
 load_on_open_data_offset       root index block            "IDXROOT2"
+                               meta index block            "IDXROOT2"
 file_info_offset               file info block             "FILEINF2"
+                               bloom filter metadata       "BLMFMET2"
 filesize - 4096                fixed file trailer          "TRABLK\"$"
 ```
 
 Everything before `load_on_open_data_offset` belongs to the data section and is only reachable
 through the index; everything from `load_on_open_data_offset` to the trailer is the
-"load on open" section (`HFileInfo.initMetaAndIndex`).
+"load on open" section (`HFileInfo.initMetaAndIndex`). The load on open section is read as a
+sequential run of blocks: root index, meta index, file info, then any "additional" load on open
+blocks such as the bloom filter metadata.
 
 ## Block framing
 
@@ -158,10 +164,72 @@ The two are mutually incompatible, so the framing must be chosen at write time
 payload: a zstd frame always starts with `28 b5 2f fd`, and the `hbase` framing is
 self-describing because it repeats the block's uncompressed size.
 
+`SNAPPY` payloads are what `SnappyCodec` writes, i.e. Hadoop's `BlockCompressorStream` layout:
+
+```text
+<uncompressedSize:4 BE><compressedSize:4 BE><raw snappy bytes>...
+```
+
+The header is the number of bytes the block expands to. The chunk count is not stored, so a reader
+consumes length-prefixed chunk pairs until it has produced that many bytes. An HFile block is a
+single write followed by `finish()`, so a block below `bufferSize - (bufferSize/6 + 32)` with the
+default 256 KiB buffersize (218422 bytes) is one chunk pair; larger blocks are split into several.
+The chunk bytes themselves are raw snappy, not the snappy framing format.
+
+Two codecs produce this layout and their output is interchangeable: Hadoop's native
+`org.apache.hadoop.io.compress.SnappyCodec` and HBase's pure Java
+`org.apache.hadoop.hbase.io.compress.xerial.SnappyCodec` (`hbase.io.compress.snappy.codec`, which
+deliberately mirrors it). Unlike `ZSTD`, no framing choice is needed.
+
+## Meta blocks
+
+`HFile.Writer#appendMetaBlock(name, payload)` stores opaque bytes under a name. The blocks are
+written as `METABLKc` right above the data blocks, in name order, and the meta index (a second
+`IDXROOT2` block, holding `meta_index_count` entries of `(offset:long, onDiskSize:int, key)` in the
+same layout as the data root index) maps name to location. The meta index is always written, even
+when it lists nothing, and `FixedFileTrailer.metaIndexCount` still counts only `METABLKc` blocks —
+the bloom filter metadata is not part of it. HBase's `getMetaBlock` returns the entry whose first
+key is less than or equal to the requested name, so an unknown name yields a neighbouring block;
+this crate returns `None` instead.
+
+## Bloom filters
+
+A `ROW` bloom filter is written in three places:
+
+* one `BLMFBLK2` block per chunk, in the data section, whose payload is the bare bit array;
+* a `BLMFMET2` block as the last load on open block, holding the shared parameters and a single
+  level index of `(firstKey, offset, size)` per chunk;
+* the file info key `BLOOM_FILTER_TYPE` = `ROW`.
+
+The `BLMFMET2` payload (`CompoundBloomFilterWriter.MetaWriter`) is:
+
+```text
+<int VERSION=3><long totalByteSize><int hashCount><int hashType>
+<long totalKeyCount><long totalMaxKeys><int numChunks>
+<vint comparatorClassLength=0><byte array: 0 bytes>       # ROW needs no comparator
+numChunks * ( <long offset><int onDiskSize><vint keyLength><firstKey> )
+```
+
+A row is placed in a chunk by comparator order (`firstKey` is the chunk's first row), hashed with
+murmur2 (`h1 = hash(row, 0)`, `h2 = hash(row, h1)`, `hashType = 1`) and probes
+`abs((h1 + i * h2) % (byteSize * 8))` for `i` in `0..hashCount`. Chunks are sized by
+`io.storefile.bloom.block.size` (128 KiB of bits), which at the default 1% error rate holds about
+109382 keys with 7 hash functions; a chunk that ends up far emptier than that is halved until
+`maxKeys <= 2 * keyCount`, which is lossless because every probe is a modulo of a power of two.
+
+Two details decide compatibility, and both are why this crate does not use a general purpose bloom
+filter crate: the bit array is *flat* (not blocked) and the hash is HBase's `MurmurHash`, whose
+final partial word shifts sign extended bytes. The `murmur2` crate is stock `MurmurHash2`, so it
+agrees with HBase for every key whose length is a multiple of four and zero extends the leftover
+bytes otherwise: `[0x80, 0x81, 0x82, 0x83, 0x84]` hashes to -1368132752 in HBase and -1237960112
+there. Since a probe is `hash % bitSize`, such a hash puts rows in the wrong bits, so the tail is
+assembled by hand here (see `src/hbase/bloom.rs`). `ROWCOL` filters hash a synthetic
+`row/family/qualifier` cell key and are not implemented.
+
 ## Deliberate omissions
 
-* bloom filters (`BLMFBLK2`), meta blocks and `load on open` extensions other than the index
+* `ROWCOL` and `ROWPREFIX_FIXED_LENGTH` bloom filters, and non-murmur hash types
 * encryption (`Encryption.Context`)
-* `LZO`, `SNAPPY`, `LZ4`, `BZIP2`, `LZMA`, `BROTLI` – reported as unsupported instead of being
+* `LZO`, `LZ4`, `BZIP2`, `LZMA`, `BROTLI` – reported as unsupported instead of being
   decoded with the wrong framing
 * writing multi level indexes and the `DIFF` / `FAST_DIFF` encoders

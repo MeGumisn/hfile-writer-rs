@@ -9,12 +9,16 @@
 #   * HBase 2.5.x and its Hadoop dependencies on HBASE_CLASSPATH
 #   * a JDK (javac/java) on PATH
 #   * HBASE_SITE_DIR pointing at a directory that contains hbase-site.xml, if the cluster needs
-#     one to select the zstd codec (see docs/hfile-format.md#compression)
+#     one to select the zstd or snappy codec (see docs/hfile-format.md#compression)
+#
+# `snappy` needs a codec HBase can load: either libhadoop built with snappy, or the pure Java
+# `org.apache.hadoop.hbase.io.compress.xerial.SnappyCodec` selected with
+# `hbase.io.compress.snappy.codec`. Both write the same bytes, so either works here.
 #
 # Usage:
 #   export HBASE_CLASSPATH="/opt/hbase/lib/*:/opt/hadoop/share/hadoop/common/*:..."
 #   export HBASE_SITE_DIR=/etc/hbase/conf          # optional
-#   CROSSCHECK_CODECS="none gz zstd" scripts/hbase-crosscheck.sh
+#   CROSSCHECK_CODECS="none gz snappy zstd" scripts/hbase-crosscheck.sh
 #
 # Environment:
 #   HFILE_BIN          binary to test              (default: target/release/hfile)
@@ -73,6 +77,7 @@ java_codec() {
   case "$1" in
     none) echo NONE ;;
     gz) echo GZ ;;
+    snappy) echo SNAPPY ;;
     zstd) echo ZSTD ;;
     *) echo NONE ;;
   esac
@@ -133,6 +138,91 @@ else
       fi
     done
   done
+fi
+
+LASTROW=$(printf "row%06d" $((CROSSCHECK_ROWS - 1)))
+NEXTROW=$(printf "row%06d" "$CROSSCHECK_ROWS")
+# Present rows, one past the end, and rows that sort before the file.
+BLOOMROWS="row000000 row000001 $LASTROW $NEXTROW row999999 row000000x zzz"
+
+echo "== bloom filter"
+if $JAVA WriteBloomHFile "$WORK/hbase_bloom.hfile" "$CROSSCHECK_ROWS" NONE \
+    >/dev/null 2>"$WORK/bw.err"; then
+  if $JAVA BloomCheck "$WORK/hbase_bloom.hfile" $BLOOMROWS >"$WORK/hb_bloom.txt" \
+      2>"$WORK/hb_bloom.err" && "$HFILE_BIN" bloom "$WORK/hbase_bloom.hfile" $BLOOMROWS \
+      >"$WORK/our_bloom.txt" 2>/dev/null; then
+    if diff -q "$WORK/hb_bloom.txt" "$WORK/our_bloom.txt" >/dev/null; then
+      ok "hbase -> us bloom ($(grep -c . "$WORK/hb_bloom.txt") rows, \
+$(grep -c ' maybe$' "$WORK/hb_bloom.txt") maybe)"
+    else
+      ko "hbase -> us bloom differs"
+      diff "$WORK/hb_bloom.txt" "$WORK/our_bloom.txt" | head -4
+    fi
+  else
+    ko "hbase -> us bloom: $(tail -1 "$WORK/hb_bloom.err")"
+  fi
+  if [ -f "$CELFILE" ]; then
+    if "$HFILE_BIN" arrow2hfile "$CELFILE" --out "$WORK/rs_bloom.hfile" --bloom ROW \
+        --codec none >/dev/null 2>&1 && $JAVA BloomCheck "$WORK/rs_bloom.hfile" $BLOOMROWS \
+        >"$WORK/hb_bloom2.txt" 2>"$WORK/hb_bloom2.err" && "$HFILE_BIN" bloom \
+        "$WORK/rs_bloom.hfile" $BLOOMROWS >"$WORK/our_bloom2.txt" 2>/dev/null; then
+      if diff -q "$WORK/hb_bloom2.txt" "$WORK/our_bloom2.txt" >/dev/null; then
+        ok "us -> hbase bloom"
+      else
+        ko "us -> hbase bloom differs"
+        diff "$WORK/hb_bloom2.txt" "$WORK/our_bloom2.txt" | head -4
+      fi
+    else
+      ko "us -> hbase bloom: $(tail -1 "$WORK/hb_bloom2.err")"
+    fi
+  fi
+else
+  ko "hbase bloom write: $(tail -1 "$WORK/bw.err")"
+fi
+
+# Salted, big endian row keys: nine bytes, so the last byte is a murmur tail, and half of them
+# have the high bit set. A hash that zero extends the tail puts the rows in different bits than
+# HBase did and would answer "no" for rows that are in the file.
+hexrow() { printf 'hex:%02x%016x' "$(( $1 & 0xff ))" "$(( $1 & 0xff ))"; }
+BINROWS=""
+for i in 0 1 2 0x7f 0x80 0x81 0xa5 0xc0 0xfe 0xff 70000 70001; do
+  BINROWS="$BINROWS $(hexrow "$i")"
+done
+echo "== bloom filter, binary row keys"
+if $JAVA WriteBloomHFile "$WORK/hbase_binbloom.hfile" 200 NONE binary >/dev/null \
+    2>"$WORK/bwb.err" && $JAVA BloomCheck "$WORK/hbase_binbloom.hfile" $BINROWS \
+    >"$WORK/hb_binbloom.txt" 2>"$WORK/hb_binbloom.err" && "$HFILE_BIN" bloom \
+    "$WORK/hbase_binbloom.hfile" $BINROWS >"$WORK/our_binbloom.txt" 2>/dev/null; then
+  if diff -q "$WORK/hb_binbloom.txt" "$WORK/our_binbloom.txt" >/dev/null; then
+    ok "hbase -> us bloom, signed tails ($(grep -c ' maybe$' "$WORK/hb_binbloom.txt") maybe)"
+  else
+    ko "hbase -> us bloom, signed tails differ"
+    diff "$WORK/hb_binbloom.txt" "$WORK/our_binbloom.txt" | head -4
+  fi
+else
+  ko "hbase -> us bloom, signed tails: $(tail -1 "$WORK/hb_binbloom.err")"
+fi
+
+echo "== meta blocks"
+if $JAVA WriteMetaHFile "$WORK/hbase_meta.hfile" "$CROSSCHECK_ROWS" >/dev/null 2>&1; then
+  names=$("$HFILE_BIN" info "$WORK/hbase_meta.hfile" 2>/dev/null | grep "meta blocks")
+  first=$("$HFILE_BIN" meta "$WORK/hbase_meta.hfile" meta-a 2>&1)
+  second=$("$HFILE_BIN" meta "$WORK/hbase_meta.hfile" meta-b 2>&1)
+  if [ "$first" = "hello-meta" ] && [ "$second" = "second block" ]; then
+    ok "hbase -> us meta blocks $names"
+  else
+    ko "hbase -> us meta blocks: '$first' / '$second' $names"
+  fi
+fi
+if [ -f "$CELFILE" ] && "$HFILE_BIN" arrow2hfile "$CELFILE" --out "$WORK/rs_meta.hfile" \
+    --meta meta-a=hello-meta --meta "meta-b=second block" >/dev/null 2>&1; then
+  ref=$($JAVA MetaBlockCheck "$WORK/rs_meta.hfile" meta-a meta-b 2>/dev/null | grep '^meta-' \
+    | tr '\n' '|')
+  if [ "$ref" = "meta-a hello-meta|meta-b second block|" ]; then
+    ok "us -> hbase meta blocks"
+  else
+    ko "us -> hbase meta blocks: $ref"
+  fi
 fi
 
 echo

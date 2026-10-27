@@ -92,6 +92,60 @@ Notes that save debugging time:
 * Nested types (`List`, `Struct`, `Map`), `Float16` and dictionary-encoded columns are rejected
   with `invalid argument: unsupported Arrow type ...`.
 
+## Async conversions
+
+`arrow::async_io` mirrors `arrow::read` / `arrow::write` on top of the official async Parquet API
+(`ParquetRecordBatchStreamBuilder` for input, `AsyncArrowWriter` for output) and the tokio HFile
+types. Nothing is reimplemented: the mapping, layouts, sorting and statistics are the same code
+paths, so the two APIs produce identical output for identical input.
+
+| function | direction |
+|----------|-----------|
+| `async_io::parquet_to_hfile(input, out, &mapping, WriterOptions)` | Parquet -> HFile |
+| `async_io::hfile_to_parquet(hfile, out, &ReadOptions)` | HFile -> Parquet |
+| `async_io::read_parquet(input)` / `async_io::source_schema(input)` | Parquet metadata / batches |
+| `async_io::write_cells(out, cells, WriterOptions)` | sorted cells -> HFile |
+
+```rust
+use hfile_rs::arrow::Mapping;
+use hfile_rs::arrow::async_io::{hfile_to_parquet, parquet_to_hfile};
+use hfile_rs::arrow::read::ReadOptions;
+use hfile_rs::hbase::WriterOptions;
+
+async fn example() -> hfile_rs::Result<()> {
+let mapping = Mapping {
+    row_key: vec!["id".to_string()],
+    family: Some("cf".to_string()),
+    ..Default::default()
+};
+let stats = parquet_to_hfile("in.parquet", "out.hfile", &mapping, WriterOptions::default()).await?;
+assert_eq!(stats.rows, 3);
+
+let options = ReadOptions {
+    mapping,
+    schema: Some(hfile_rs::arrow::async_io::source_schema("in.parquet").await?),
+    ..Default::default()
+};
+hfile_to_parquet("out.hfile", "back.parquet", &options).await?;
+Ok(())
+}
+```
+
+What stays the same and what changes:
+
+* **Same format, both ways.** An async written HFile opens with `HFileReader`, and a Parquet file
+  written by `AsyncArrowWriter` opens with `arrow::write::read_parquet`.
+* **Sorting is still in memory.** The HFile side needs cells in `CellComparator` order, so
+  `parquet_to_hfile` buffers the cells and sorts them (on the blocking pool). For data that does
+  not fit, pre-sort the Parquet and stream with `AsyncHFileWriter::append`.
+* **Batch field conversion runs off the runtime.** Each record batch is mapped to cells with
+  `tokio::task::spawn_blocking`, so a large schema/`binary` conversion does not stall the reactor.
+* **Bounded memory on the read side.** `hfile_to_parquet` walks HFile blocks and feeds
+  `AsyncArrowWriter` as batches are completed; only one HFile block plus one Parquet row group is
+  resident. `ReadOptions::limit` stops the scan early.
+* **CLI unchanged.** `hfile arrow2hfile` / `hfile hfile2arrow` keep using the blocking API; the
+  async path is for library users that already own a tokio runtime.
+
 ## CLI examples
 
 ```bash

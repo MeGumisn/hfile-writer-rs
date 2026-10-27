@@ -204,6 +204,109 @@ fn raw_layout_accepts_an_explicit_rowkey_column_on_the_command_line() {
     );
 }
 
+/// A batch whose row key is a plain UTF-8 string, so `hfile bloom` can be given rows as text.
+fn string_row_batch() -> arrow_array::RecordBatch {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["row1", "row2", "row3"])),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+        ],
+    )
+    .expect("build batch")
+}
+
+#[test]
+fn bloom_and_meta_flags_are_written_and_queryable() {
+    let dir = TempDir::new("cli-bloom");
+    let parquet = dir.join("in.parquet");
+    common::write_parquet(&parquet, &string_row_batch());
+    let hfile = dir.join("bloom.hfile");
+
+    let write = run(&[
+        "arrow2hfile",
+        s(&parquet),
+        "--out",
+        s(&hfile),
+        "--row-key",
+        "id",
+        "--family",
+        "cf",
+        "--bloom",
+        "ROW",
+        "--meta",
+        "owner=warehouse",
+    ]);
+    assert!(
+        write.status.success(),
+        "arrow2hfile failed: {}",
+        stderr(&write)
+    );
+
+    let info = stdout(&run(&["info", s(&hfile)]));
+    assert!(info.contains("bloom filter: ROW"), "info said:\n{info}");
+    assert!(
+        info.contains(r#"meta blocks: ["owner"]"#),
+        "info said:\n{info}"
+    );
+
+    let bloom = run(&["bloom", s(&hfile), "row1", "row2", "row3", "absent"]);
+    assert!(bloom.status.success(), "bloom failed: {}", stderr(&bloom));
+    let answers = stdout(&bloom);
+    for row in ["row1", "row2", "row3"] {
+        assert!(
+            answers.contains(&format!("{row} maybe")),
+            "row {row} rejected:\n{answers}"
+        );
+    }
+
+    // `hex:` spells a row that is awkward to type, e.g. a binary HBase key.
+    let hex = run(&["bloom", s(&hfile), "hex:726f7731"]);
+    assert!(
+        stdout(&hex).contains("hex:726f7731 maybe"),
+        "hex row rejected: {}",
+        stdout(&hex)
+    );
+
+    let meta = run(&["meta", s(&hfile), "owner"]);
+    assert_eq!(stdout(&meta).trim_end(), "warehouse");
+    assert!(!run(&["meta", s(&hfile), "nope"]).status.success());
+}
+
+#[test]
+fn unsupported_bloom_type_fails_with_a_clear_message() {
+    let dir = TempDir::new("cli-bloom-invalid");
+    let parquet = dir.join("in.parquet");
+    common::write_parquet(&parquet, &common::demo_batch());
+
+    let out = run(&[
+        "arrow2hfile",
+        s(&parquet),
+        "--out",
+        s(&dir.join("bad.hfile")),
+        "--row-key",
+        "id",
+        "--family",
+        "cf",
+        "--bloom",
+        "ROWCOL",
+    ]);
+    assert!(!out.status.success(), "ROWCOL must not be writable");
+    let message = stderr(&out);
+    assert!(
+        message.contains("ROWCOL") && message.contains("not implemented"),
+        "unexpected error: {message}"
+    );
+}
+
 #[test]
 fn unsupported_encoding_fails_with_a_clear_message() {
     let dir = TempDir::new("cli-invalid");

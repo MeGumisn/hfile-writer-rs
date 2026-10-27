@@ -10,15 +10,20 @@
 ```text
 偏移 0                         第一个数据块               "DATABLK*" / "DATABLKE"
         ...                    更多数据块                 通过 prevBlockOffset 反向串成链表
+        ...                    bloom 分块                 "BLMFBLK2"
+        ...                    meta block                 "METABLKc"
 last_data_block_offset         最后一个数据块
 load_on_open_data_offset       根索引块                   "IDXROOT2"
+                               meta 索引块                "IDXROOT2"
 file_info_offset               文件信息块                 "FILEINF2"
+                               bloom filter 元数据        "BLMFMET2"
 文件大小 - 4096                固定文件尾部                "TRABLK\"$"
 ```
 
 `load_on_open_data_offset` 之前的区域属于数据区，只能通过索引到达；从
 `load_on_open_data_offset` 到文件尾属于 "load on open" 区（对应
-`HFileInfo.initMetaAndIndex`）。
+`HFileInfo.initMetaAndIndex`）。该区是按顺序读的一串块：根索引、meta 索引、文件信息，
+以及随后的"附加"块（例如 bloom filter 元数据）。
 
 ## 块结构
 
@@ -153,10 +158,68 @@ hbase      <未压缩长度:4><帧长度:4><zstd 帧>                       hbas
 `--zstd-framing`）。读取时按负载自行判别：zstd 帧总是以 `28 b5 2f fd` 开头，而 `hbase`
 框架自带自描述信息（重复了块的未压缩长度）。
 
+`SNAPPY` 负载就是 `SnappyCodec` 写出的形式，即 Hadoop `BlockCompressorStream` 的块布局：
+
+```text
+<未压缩长度:4 BE><压缩长度:4 BE><raw snappy 字节>...
+```
+
+头部是该块解压后的字节数。分块个数并不落盘，读取方只需不断消费"长度 + 数据"直到凑满
+这个字节数。HFile 一个块只做一次 write 加一次 `finish()`，因此小于
+`bufferSize - (bufferSize/6 + 32)`（默认 256 KiB 缓冲即 218422 字节）的块正好一对，更大的
+块会被切成多对。分块数据本身是 raw snappy，而不是 snappy 的 framing 格式。
+
+写出这种布局的编解码器有两个，输出可以互换：Hadoop 原生的
+`org.apache.hadoop.io.compress.SnappyCodec`，以及 HBase 纯 Java 的
+`org.apache.hadoop.hbase.io.compress.xerial.SnappyCodec`（`hbase.io.compress.snappy.codec`，
+它刻意与前者保持一致）。与 `ZSTD` 不同，这里不需要选择框架。
+
+## Meta block
+
+`HFile.Writer#appendMetaBlock(name, payload)` 把一段不透明字节存在名字下。这些块以
+`METABLKc` 紧挨在数据块之后按名字排序写出，再由 meta 索引（第二个 `IDXROOT2` 块，
+`meta_index_count` 条 `(offset:long, onDiskSize:int, key)`，布局与数据根索引完全一致）
+记录名字到位置的映射。该索引块总是写出，即使一条都不含；`FixedFileTrailer.metaIndexCount`
+也只统计 `METABLKc`，不含 bloom filter 元数据。HBase 的 `getMetaBlock` 返回首个 key
+小于等于目标名字的条目，因此查一个不存在的名字会拿到相邻的块；本 crate 则返回 `None`。
+
+## Bloom filter
+
+`ROW` bloom filter 写在三处：
+
+* 数据区里每个分块一个 `BLMFBLK2` 块，负载就是裸的位图；
+* load on open 区最后一个块 `BLMFMET2`，保存公共参数与"每块 `(firstKey, offset, size)`"
+  的单层索引；
+* 文件信息键 `BLOOM_FILTER_TYPE` = `ROW`。
+
+`BLMFMET2` 的负载（`CompoundBloomFilterWriter.MetaWriter`）为：
+
+```text
+<int VERSION=3><long totalByteSize><int hashCount><int hashType>
+<long totalKeyCount><long totalMaxKeys><int numChunks>
+<vint 比较器名长度=0><0 字节>                              # ROW 不需要比较器
+numChunks * ( <long offset><int onDiskSize><vint 键长><firstKey> )
+```
+
+一行归属哪个分块由比较器顺序决定（`firstKey` 是该分块的第一行）；计算时用 murmur2
+（`h1 = hash(row, 0)`、`h2 = hash(row, h1)`、`hashType = 1`），对
+`i` 取 `abs((h1 + i * h2) % (byteSize * 8))`，共 `hashCount` 次。分块大小由
+`io.storefile.bloom.block.size`（128 KiB 位图）决定，默认 1% 误差率下约容纳 109382 个键、
+7 个哈希函数；如果某个分块最后远没装满，会不断折半直到 `maxKeys <= 2 * keyCount`，
+由于所有探测位置都是 2 的幂取模，折半不会丢失任何命中。
+
+有两点决定兼容性，也正是本 crate 没有直接使用通用 bloom filter crate 的原因：位图是**扁平**的
+（不是分块式），哈希用的是 HBase 自己的 `MurmurHash`（末尾不足 4 字节时按符号扩展移位）。
+`murmur2` crate 是标准 `MurmurHash2`，长度是 4 的倍数时与 HBase 完全一致，但末尾字节按无符号
+扩展：`[0x80, 0x81, 0x82, 0x83, 0x84]` 在 HBase 是 -1368132752，在它那里是 -1237960112。
+探测位置是 `hash % bitSize`，哈希不同就意味着落在不同的位，所以末尾部分由本 crate 自己拼装
+（见 `src/hbase/bloom.rs`）。`ROWCOL` 过滤器的哈希键是拼出来的
+`row/family/qualifier` 单元键，本 crate 未实现。
+
 ## 有意省略的部分
 
-* bloom filter（`BLMFBLK2`）、meta block，以及除索引之外的 load-on-open 扩展
+* `ROWCOL` 与 `ROWPREFIX_FIXED_LENGTH` bloom filter，以及非 murmur 的哈希类型
 * 加密（`Encryption.Context`）
-* `LZO`、`SNAPPY`、`LZ4`、`BZIP2`、`LZMA`、`BROTLI` —— 一律报"不支持"，而不是用错误的
+* `LZO`、`LZ4`、`BZIP2`、`LZMA`、`BROTLI` —— 一律报"不支持"，而不是用错误的
   框架去解
 * 写入多层索引，以及 `DIFF` / `FAST_DIFF` 编码器

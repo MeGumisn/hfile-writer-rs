@@ -24,6 +24,7 @@ serde_json = "1"
 # block compression (HBase codec ordinals: NONE=2, GZ=1, BZIP2=5, ZSTD=6)
 flate2 = "1"
 zstd = "0.13"
+snap = "1"
 
 # Arrow / Parquet interop
 arrow-array = "60"
@@ -32,15 +33,26 @@ arrow-select = "60"
 arrow-cast = "60"
 parquet = { version = "60", default-features = false, features = [
     "arrow",
+    "async",
     "snap",
     "flate2",
     "flate2-rust_backend",
     "zstd",
 ] }
 
+# `ParquetRecordBatchStream` is a `futures_core::Stream`; the async reader/writer in
+# `src/arrow/async_io.rs` drives it with `StreamExt::next`.
+futures = "0.3"
+
+tokio = { version = "1", features = ["full"] }
 [build-dependencies]
 prost-build = "0.14"
 protox = "0.10"
+
+[dev-dependencies]
+# Tests only: a stock `MurmurHash2` to prove where it diverges from HBase's signed tail. The
+# bloom filter itself cannot use it, see `src/hbase/bloom.rs`.
+murmur2 = "0"
 
 [lib]
 name = "hfile_rs"

@@ -30,6 +30,8 @@ hfile arrow2bulkload hits.parquet \
 | `--encoding` | `NONE` | bulk load 通常用 `PREFIX` 或 `ROW_INDEX_V1` 更合适 |
 | `--codec` | `none` | 必须是集群能读的算法 |
 | `--zstd-framing` | `raw` | Hadoop 编解码器用 `raw`，`hbase-compression-zstd` 用 `hbase` |
+| `--bloom` | `none` | 取 `ROW` 时写入 bloom filter，按行读取的表值得开 |
+| `--meta` | – | `NAME=VALUE`，可重复；写成 meta block |
 | `--block-size` | 集群默认 | 目标数据块大小（字节） |
 
 产物：

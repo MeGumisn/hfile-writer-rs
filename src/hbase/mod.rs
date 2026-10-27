@@ -11,10 +11,14 @@
 //! | `index`      | `HFileBlockIndex`, `NoOpIndexBlockEncoder`            |
 //! | `encoding`   | `DataBlockEncoding` + the four codecs                 |
 //! | `compression`| `Compression.Algorithm`                               |
+//! | `bloom`      | `CompoundBloomFilter`, `BloomFilterChunk`, `MurmurHash`|
 //! | `reader`     | `HFileReaderImpl`, `HFileScannerImpl`                 |
 //! | `writer`     | `HFileWriterImpl`                                     |
+//! | `async_io`   | tokio façade over `reader` / `writer`                 |
 
+pub mod async_io;
 pub mod block;
+pub mod bloom;
 pub mod compression;
 pub mod encoding;
 pub mod file_info;
@@ -30,7 +34,9 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/hbase.pb.rs"));
 }
 
+pub use async_io::{AsyncHFileReader, AsyncHFileWriter};
 pub use block::{Block, BlockHeader, BlockType, HEADER_SIZE};
+pub use bloom::{BloomFilter, BloomOptions, BloomType};
 pub use compression::{Compression, ZstdFraming};
 pub use encoding::{BlockEncoder, DataBlockEncoding, DecodeOptions};
 pub use file_info::FileInfo;

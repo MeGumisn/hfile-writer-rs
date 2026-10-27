@@ -87,6 +87,61 @@ ts   Int64   -> HBase 时间戳        （通过 --timestamp-column）
 * 嵌套类型（`List`、`Struct`、`Map`）、`Float16` 和字典编码列都会被拒绝，报
   `invalid argument: unsupported Arrow type ...`。
 
+## 异步转换
+
+`arrow::async_io` 在官方异步 Parquet API（读用 `ParquetRecordBatchStreamBuilder`，写用
+`AsyncArrowWriter`）与 tokio 版 HFile 类型之上，提供与 `arrow::read` / `arrow::write` 对应的
+转换。它不是另一套实现：mapping、两种布局、排序与统计量都走同一段代码，因此相同输入下两种
+API 的输出完全一致。
+
+| 函数 | 方向 |
+|------|------|
+| `async_io::parquet_to_hfile(input, out, &mapping, WriterOptions)` | Parquet -> HFile |
+| `async_io::hfile_to_parquet(hfile, out, &ReadOptions)` | HFile -> Parquet |
+| `async_io::read_parquet(input)` / `async_io::source_schema(input)` | 读取 Parquet 元数据 / batch |
+| `async_io::write_cells(out, cells, WriterOptions)` | 已排序 cells -> HFile |
+
+```rust
+use hfile_rs::arrow::Mapping;
+use hfile_rs::arrow::async_io::{hfile_to_parquet, parquet_to_hfile};
+use hfile_rs::arrow::read::ReadOptions;
+use hfile_rs::hbase::WriterOptions;
+
+async fn example() -> hfile_rs::Result<()> {
+    let mapping = Mapping {
+        row_key: vec!["id".to_string()],
+        family: Some("cf".to_string()),
+        ..Default::default()
+    };
+    let stats =
+        parquet_to_hfile("in.parquet", "out.hfile", &mapping, WriterOptions::default()).await?;
+    assert_eq!(stats.rows, 3);
+
+    let options = ReadOptions {
+        mapping,
+        schema: Some(hfile_rs::arrow::async_io::source_schema("in.parquet").await?),
+        ..Default::default()
+    };
+    hfile_to_parquet("out.hfile", "back.parquet", &options).await?;
+    Ok(())
+}
+```
+
+哪些不变、哪些变化：
+
+* **格式双向一致。** 异步写出的 HFile 可以用 `HFileReader` 打开，`AsyncArrowWriter` 写出的
+  Parquet 可以用 `arrow::write::read_parquet` 打开。
+* **排序仍在内存中。** HFile 一侧要求 cell 按 `CellComparator` 有序，因此 `parquet_to_hfile`
+  会缓冲 cells 并在阻塞线程池里排序。数据放不进内存时，请先对 Parquet 预排序，再用
+  `AsyncHFileWriter::append` 流式写入。
+* **字段转换不占用运行时线程。** 每个 record batch 的映射通过 `tokio::task::spawn_blocking`
+  执行，大 schema 或 `binary` 编码转换不会卡住 reactor。
+* **读方向内存有界。** `hfile_to_parquet` 逐块读取 HFile，并在 batch 凑满时立刻交给
+  `AsyncArrowWriter`，常驻内存只有一个 HFile 块加一个 Parquet row group。
+  `ReadOptions::limit` 可以提前结束扫描。
+* **CLI 不变。** `hfile arrow2hfile` / `hfile hfile2arrow` 继续走同步 API；异步路径面向已经有
+  tokio runtime 的库调用方。
+
 ## CLI 示例
 
 ```bash

@@ -9,8 +9,8 @@
 //! Without these flags a reader cannot split a plain `DATABLK*` payload into cells.
 
 use crate::error::{Result, corrupt};
-use crate::hbase::pb::FileInfoProto;
 use crate::hbase::pb::BytesBytesPair;
+use crate::hbase::pb::FileInfoProto;
 use prost::Message;
 use std::collections::BTreeMap;
 
@@ -45,6 +45,13 @@ pub mod keys {
     pub const MAJOR_COMPACTION_KEY: &str = "MAJOR_COMPACTION_KEY";
     /// Minimum/maximum timestamp of the file.
     pub const TIMERANGE: &str = "TIMERANGE";
+    /// Bloom filter type written next to the filter (`ROW`, `ROWCOL`).
+    ///
+    /// `HStoreFile.BLOOM_FILTER_TYPE_KEY`; informational, the filter itself is in the
+    /// `BLMFMET2` block.
+    pub const BLOOM_FILTER_TYPE: &str = "BLOOM_FILTER_TYPE";
+    /// Bloom filter parameter, e.g. the row prefix length (`HStoreFile.BLOOM_FILTER_PARAM_KEY`).
+    pub const BLOOM_FILTER_PARAM: &str = "BLOOM_FILTER_PARAM";
     /// Data block encoding name (`PREFIX`, `DIFF`, `FAST_DIFF`, `ROW_INDEX_V1`).
     ///
     /// Unlike the keys above this one has no `hfile.` prefix; it is
@@ -131,6 +138,12 @@ impl FileInfo {
         self.get_i64(keys::MAX_MEMSTORE_TS_KEY).unwrap_or(0).max(0) as u64
     }
 
+    /// Bloom filter type recorded by the writer (`None` when the key is absent).
+    pub fn bloom_filter_type(&self) -> Option<String> {
+        self.get(keys::BLOOM_FILTER_TYPE)
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+    }
+
     /// True when tags were compressed inside the data blocks (not supported).
     pub fn tags_compressed(&self) -> bool {
         self.get(keys::TAGS_COMPRESSED)
@@ -173,9 +186,9 @@ impl FileInfo {
                 .collect(),
         };
         let mut pb = Vec::with_capacity(proto.encoded_len());
-        proto
-            .encode(&mut pb)
-            .map_err(|e| crate::error::corrupt_error(format!("failed to encode file info protobuf: {e}")))?;
+        proto.encode(&mut pb).map_err(|e| {
+            crate::error::corrupt_error(format!("failed to encode file info protobuf: {e}"))
+        })?;
         let mut out = Vec::with_capacity(PB_MAGIC.len() + 5 + pb.len());
         out.extend_from_slice(PB_MAGIC);
         crate::hbase::kv::write_compressed_int(&mut out, pb.len() as i32);

@@ -28,7 +28,8 @@ pub fn decode(body: &[u8], options: DecodeOptions) -> Result<Vec<Cell>> {
         if key_rest < 0 || value_len < 0 || common < 0 {
             return corrupt("negative length in prefix encoded block");
         }
-        let (key_rest, value_len, common) = (key_rest as usize, value_len as usize, common as usize);
+        let (key_rest, value_len, common) =
+            (key_rest as usize, value_len as usize, common as usize);
         if common > prev_key.len() {
             return corrupt("prefix encoded block references a common prefix longer than the key");
         }

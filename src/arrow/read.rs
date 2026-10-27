@@ -9,6 +9,7 @@
 
 use super::{Mapping, ValueEncoding, decode_values};
 use crate::error::{HFileError, Result, corrupt, invalid};
+use crate::hbase::kv::Cell;
 use crate::hbase::reader::HFileReader;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -61,7 +62,7 @@ pub fn raw_schema() -> SchemaRef {
 }
 
 #[derive(Debug, Clone)]
-enum ColumnSource {
+pub(crate) enum ColumnSource {
     /// Part `index` of the row key.
     RowKeyPart(usize),
     /// Cell column identified by family/qualifier.
@@ -119,7 +120,7 @@ fn split_row(row: &[u8], separator: &[u8], parts: usize) -> Result<Vec<Vec<u8>>>
     Ok(out)
 }
 
-struct BatchBuilder {
+pub(crate) struct BatchBuilder {
     schema: SchemaRef,
     columns: Vec<Vec<Option<Vec<u8>>>>,
     rows: usize,
@@ -185,113 +186,115 @@ impl BatchBuilder {
     }
 }
 
-/// Stream HFile contents as record batches.
-pub fn for_each_batch<F>(
-    reader: &HFileReader,
-    options: &ReadOptions,
-    mut emit: F,
-) -> Result<ReadStats>
-where
-    F: FnMut(RecordBatch) -> Result<()>,
-{
-    let mut stats = ReadStats::default();
-    match &options.schema {
-        None => {
-            let schema = raw_schema();
-            let mut builder =
-                BatchBuilder::uniform(schema, options.batch_size, ValueEncoding::Binary);
-            for cell in reader.iter() {
-                let cell = cell?;
-                if let Some(limit) = options.limit
-                    && stats.rows >= limit
-                {
-                    break;
-                }
-                stats.cells += 1;
-                stats.rows += 1;
+/// State machine that turns a stream of cells into record batches.
+///
+/// Split out of [`for_each_batch`] so that the async converter in `arrow::async_io` can feed it
+/// from [`AsyncHFileReader::for_each`] without duplicating the raw/wide mapping logic.
+pub(crate) enum BatchAssembler {
+    Raw {
+        builder: BatchBuilder,
+        rows: usize,
+    },
+    Wide {
+        sources: Vec<ColumnSource>,
+        separator: Vec<u8>,
+        key_columns: usize,
+        builder: BatchBuilder,
+        current_row: Option<Vec<u8>>,
+        values: Vec<Option<Vec<u8>>>,
+        row_timestamp: i64,
+        rows: usize,
+    },
+}
+
+impl BatchAssembler {
+    pub(crate) fn new(options: &ReadOptions) -> Result<Self> {
+        match &options.schema {
+            None => Ok(BatchAssembler::Raw {
+                builder: BatchBuilder::uniform(
+                    raw_schema(),
+                    options.batch_size,
+                    ValueEncoding::Binary,
+                ),
+                rows: 0,
+            }),
+            Some(schema) => {
+                let sources = resolve_columns(schema, &options.mapping)?;
+                let encodings = sources
+                    .iter()
+                    .map(|source| match source {
+                        // Row key parts and timestamps are written as raw big-endian bytes, so
+                        // they must be decoded the same way regardless of `value_encoding`.
+                        ColumnSource::RowKeyPart(_) | ColumnSource::Timestamp => {
+                            ValueEncoding::Binary
+                        }
+                        ColumnSource::Cell(_, _) => options.mapping.value_encoding,
+                    })
+                    .collect();
+                Ok(BatchAssembler::Wide {
+                    sources,
+                    separator: options.mapping.separator_bytes(),
+                    key_columns: options.mapping.row_key.len(),
+                    builder: BatchBuilder::new(schema.clone(), options.batch_size, encodings),
+                    current_row: None,
+                    values: vec![None; schema.fields().len()],
+                    row_timestamp: i64::MIN,
+                    rows: 0,
+                })
+            }
+        }
+    }
+
+    /// Output rows completed so far (the unit the row limit counts).
+    pub(crate) fn rows(&self) -> usize {
+        match self {
+            BatchAssembler::Raw { rows, .. } | BatchAssembler::Wide { rows, .. } => *rows,
+        }
+    }
+
+    /// Add one cell, returning a batch when one is full.
+    pub(crate) fn push(&mut self, cell: Cell) -> Result<Option<RecordBatch>> {
+        match self {
+            BatchAssembler::Raw { builder, rows } => {
+                *rows += 1;
                 let values = vec![
-                    Some(cell.row.clone()),
-                    Some(cell.family.clone()),
-                    Some(cell.qualifier.clone()),
-                    Some(cell.value.clone()),
+                    Some(cell.row),
+                    Some(cell.family),
+                    Some(cell.qualifier),
+                    Some(cell.value),
                     Some(cell.timestamp.to_be_bytes().to_vec()),
                     Some(vec![cell.cell_type.code()]),
                 ];
-                if let Some(batch) = builder.push(values)? {
-                    emit(batch)?;
-                }
+                builder.push(values)
             }
-            if let Some(batch) = builder.finish()? {
-                emit(batch)?;
-            }
-        }
-        Some(schema) => {
-            let sources = resolve_columns(schema, &options.mapping)?;
-            let separator = options.mapping.separator_bytes();
-            let encodings = sources
-                .iter()
-                .map(|source| match source {
-                    // Row key parts and timestamps are written as raw big-endian bytes, so they
-                    // must be decoded the same way regardless of `value_encoding`.
-                    ColumnSource::RowKeyPart(_) | ColumnSource::Timestamp => ValueEncoding::Binary,
-                    ColumnSource::Cell(_, _) => options.mapping.value_encoding,
-                })
-                .collect();
-            let mut builder = BatchBuilder::new(schema.clone(), options.batch_size, encodings);
-
-            let mut current_row: Option<Vec<u8>> = None;
-            let mut values: Vec<Option<Vec<u8>>> = vec![None; schema.fields().len()];
-            let mut row_timestamp = i64::MIN;
-
-            let flush = |row: &[u8],
-                         values: &mut Vec<Option<Vec<u8>>>,
-                         row_timestamp: i64,
-                         builder: &mut BatchBuilder,
-                         stats: &mut ReadStats|
-             -> Result<Option<RecordBatch>> {
-                // Fill row key columns.
-                let key_parts = if options.mapping.row_key.len() == 1 {
-                    vec![row.to_vec()]
-                } else {
-                    split_row(row, &separator, options.mapping.row_key.len())?
-                };
-                for (i, source) in sources.iter().enumerate() {
-                    match source {
-                        ColumnSource::RowKeyPart(part) => {
-                            values[i] = Some(key_parts[*part].clone());
-                        }
-                        ColumnSource::Timestamp => {
-                            values[i] = Some(row_timestamp.to_be_bytes().to_vec());
-                        }
-                        ColumnSource::Cell(_, _) => {}
-                    }
-                }
-                stats.rows += 1;
-                let batch = builder.push(std::mem::take(values))?;
-                *values = vec![None; builder.columns.len()];
-                Ok(batch)
-            };
-
-            for cell in reader.iter() {
-                let cell = cell?;
-                if let Some(limit) = options.limit
-                    && stats.rows >= limit
-                {
-                    break;
-                }
-                stats.cells += 1;
+            BatchAssembler::Wide {
+                sources,
+                separator,
+                key_columns,
+                builder,
+                current_row,
+                values,
+                row_timestamp,
+                rows,
+            } => {
+                let mut batch = None;
                 if current_row.as_deref() != Some(cell.row.as_slice()) {
-                    let mut batch = None;
                     if let Some(row) = current_row.take() {
-                        batch = flush(&row, &mut values, row_timestamp, &mut builder, &mut stats)?;
+                        batch = flush_row(
+                            &row,
+                            values,
+                            *row_timestamp,
+                            builder,
+                            sources,
+                            *key_columns,
+                            separator,
+                            rows,
+                        )?;
                     }
-                    current_row = Some(cell.row.clone());
-                    row_timestamp = i64::MIN;
-                    if let Some(batch) = batch {
-                        emit(batch)?;
-                    }
+                    *current_row = Some(cell.row.clone());
+                    *row_timestamp = i64::MIN;
                 }
-                row_timestamp = row_timestamp.max(cell.timestamp);
+                *row_timestamp = (*row_timestamp).max(cell.timestamp);
                 for (i, source) in sources.iter().enumerate() {
                     if let ColumnSource::Cell(family, qualifier) = source
                         && *family == cell.family
@@ -302,18 +305,108 @@ where
                         values[i] = Some(cell.value.clone());
                     }
                 }
-            }
-            if let Some(row) = current_row.take() {
-                let batch = flush(&row, &mut values, row_timestamp, &mut builder, &mut stats)?;
-                if let Some(batch) = batch {
-                    emit(batch)?;
-                }
-            }
-            if let Some(batch) = builder.finish()? {
-                emit(batch)?;
+                Ok(batch)
             }
         }
     }
+
+    /// Flush the last partial batch.
+    pub(crate) fn finish(&mut self) -> Result<Option<RecordBatch>> {
+        match self {
+            BatchAssembler::Raw { builder, .. } => builder.finish(),
+            BatchAssembler::Wide {
+                sources,
+                separator,
+                key_columns,
+                builder,
+                current_row,
+                values,
+                row_timestamp,
+                rows,
+            } => {
+                if let Some(row) = current_row.take()
+                    && let Some(batch) = flush_row(
+                        &row,
+                        values,
+                        *row_timestamp,
+                        builder,
+                        sources,
+                        *key_columns,
+                        separator,
+                        rows,
+                    )?
+                {
+                    // `flush_row` handed out a full batch, so the builder is empty and there is
+                    // nothing left to flush.
+                    return Ok(Some(batch));
+                }
+                builder.finish()
+            }
+        }
+    }
+}
+
+/// Turn the accumulated row values into one output row.
+#[allow(clippy::too_many_arguments)]
+fn flush_row(
+    row: &[u8],
+    values: &mut Vec<Option<Vec<u8>>>,
+    row_timestamp: i64,
+    builder: &mut BatchBuilder,
+    sources: &[ColumnSource],
+    key_columns: usize,
+    separator: &[u8],
+    rows: &mut usize,
+) -> Result<Option<RecordBatch>> {
+    let key_parts = if key_columns == 1 {
+        vec![row.to_vec()]
+    } else {
+        split_row(row, separator, key_columns)?
+    };
+    for (i, source) in sources.iter().enumerate() {
+        match source {
+            ColumnSource::RowKeyPart(part) => {
+                values[i] = Some(key_parts[*part].clone());
+            }
+            ColumnSource::Timestamp => {
+                values[i] = Some(row_timestamp.to_be_bytes().to_vec());
+            }
+            ColumnSource::Cell(_, _) => {}
+        }
+    }
+    *rows += 1;
+    let batch = builder.push(std::mem::take(values))?;
+    *values = vec![None; builder.columns.len()];
+    Ok(batch)
+}
+
+/// Stream HFile contents as record batches.
+pub fn for_each_batch<F>(
+    reader: &HFileReader,
+    options: &ReadOptions,
+    mut emit: F,
+) -> Result<ReadStats>
+where
+    F: FnMut(RecordBatch) -> Result<()>,
+{
+    let mut stats = ReadStats::default();
+    let mut assembler = BatchAssembler::new(options)?;
+    for cell in reader.iter() {
+        let cell = cell?;
+        if let Some(limit) = options.limit
+            && assembler.rows() >= limit
+        {
+            break;
+        }
+        stats.cells += 1;
+        if let Some(batch) = assembler.push(cell)? {
+            emit(batch)?;
+        }
+    }
+    if let Some(batch) = assembler.finish()? {
+        emit(batch)?;
+    }
+    stats.rows = assembler.rows();
     Ok(stats)
 }
 

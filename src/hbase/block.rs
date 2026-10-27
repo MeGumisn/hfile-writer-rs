@@ -17,6 +17,7 @@
 
 use crate::error::{Result, corrupt, unsupported};
 use crate::hbase::compression::{Compression, ZstdFraming};
+use std::borrow::Cow;
 use std::fs::File;
 
 /// Length of a block magic.
@@ -243,6 +244,13 @@ pub fn read_header_at(file: &File, file_size: u64, offset: u64) -> Result<BlockH
     BlockHeader::parse(&buf)
 }
 
+/// Bytes fetched by the first read of a block.
+///
+/// A block is usually smaller than this, so header and payload arrive in a single `pread`
+/// instead of two. That matters on high latency storage (network mounts, 9p, object gateways)
+/// where each syscall costs a round trip: on WSL's `/mnt/c` it is worth roughly 3x.
+pub const FETCH_CHUNK: u64 = 128 * 1024;
+
 /// Read, verify and decompress the block at `offset`.
 pub fn read_block_at(
     file: &File,
@@ -253,6 +261,30 @@ pub fn read_block_at(
     expected: Option<BlockType>,
 ) -> Result<Block> {
     let header = read_header_at(file, file_size, offset)?;
+    read_block_with_header(
+        file,
+        file_size,
+        offset,
+        header,
+        compression,
+        verify_checksums,
+        expected,
+    )
+}
+
+/// Same as [`read_block_at`] but reuses a header the caller already read.
+///
+/// Sequential scans walk the block chain, so they know the next offset from the previous
+/// block's size and can skip the extra header read entirely.
+pub fn read_block_with_header(
+    file: &File,
+    file_size: u64,
+    offset: u64,
+    header: BlockHeader,
+    compression: Compression,
+    verify_checksums: bool,
+    expected: Option<BlockType>,
+) -> Result<Block> {
     if let Some(expected) = expected
         && !(header.block_type == expected
             || (expected == BlockType::Data && header.block_type.is_data()))
@@ -269,8 +301,45 @@ pub fn read_block_at(
         ));
     }
     let mut raw = vec![0u8; total as usize];
-    read_exact_at(file, &mut raw, offset)?;
+    let first = total.min(FETCH_CHUNK);
+    read_exact_at(file, &mut raw[..first as usize], offset)?;
+    if first < total {
+        // Rare: the block is larger than FETCH_CHUNK (big cells, small compression ratio).
+        read_exact_at(file, &mut raw[first as usize..], offset + first)?;
+    }
+    decode_block_bytes(&raw, offset, header, compression, verify_checksums)
+}
 
+/// Verify and decompress a block that is already in memory.
+///
+/// `raw` must start at the block header and cover `header.total_size()` bytes. Callers that read
+/// several blocks with one syscall use this to avoid a copy per block.
+pub fn decode_block_bytes(
+    raw: &[u8],
+    offset: u64,
+    header: BlockHeader,
+    compression: Compression,
+    verify_checksums: bool,
+) -> Result<Block> {
+    let payload = decode_block_payload(raw, header, compression, verify_checksums)?.into_owned();
+    Ok(Block {
+        block_type: header.block_type,
+        offset,
+        header,
+        payload,
+    })
+}
+
+/// Verify (optionally) and decompress the payload of a block that is already in memory.
+///
+/// Returns a borrowed slice for uncompressed files, which is what a sequential scan wants: the
+/// cells can be decoded straight out of the read window without copying the payload.
+pub fn decode_block_payload<'a>(
+    raw: &'a [u8],
+    header: BlockHeader,
+    compression: Compression,
+    verify_checksums: bool,
+) -> Result<Cow<'a, [u8]>> {
     // onDiskDataSizeWithHeader includes the 33 byte header, so the payload ends here.
     let payload_end = header.on_disk_data_size_with_header as usize;
     if payload_end < HEADER_SIZE || payload_end > raw.len() {
@@ -279,7 +348,7 @@ pub fn read_block_at(
 
     if verify_checksums {
         verify_block_checksums(
-            &raw,
+            raw,
             payload_end,
             header.checksum_type,
             header.bytes_per_checksum,
@@ -287,27 +356,19 @@ pub fn read_block_at(
     }
 
     let compressed = &raw[HEADER_SIZE..payload_end];
-    let payload = if compression == Compression::None {
-        compressed.to_vec()
-    } else {
-        let out =
-            compression.decompress(compressed, header.uncompressed_size_without_header as usize)?;
-        if out.len() != header.uncompressed_size_without_header as usize {
-            return corrupt(format!(
-                "decompressed size {} does not match header value {}",
-                out.len(),
-                header.uncompressed_size_without_header
-            ));
-        }
-        out
-    };
-
-    Ok(Block {
-        block_type: header.block_type,
-        offset,
-        header,
-        payload,
-    })
+    if compression == Compression::None {
+        return Ok(Cow::Borrowed(compressed));
+    }
+    let out =
+        compression.decompress(compressed, header.uncompressed_size_without_header as usize)?;
+    if out.len() != header.uncompressed_size_without_header as usize {
+        return corrupt(format!(
+            "decompressed size {} does not match header value {}",
+            out.len(),
+            header.uncompressed_size_without_header
+        ));
+    }
+    Ok(Cow::Owned(out))
 }
 
 fn verify_block_checksums(
@@ -440,7 +501,12 @@ mod tests {
     #[test]
     fn block_roundtrip_compressed() {
         let payload = b"compressible compressible compressible".repeat(100);
-        for codec in [Compression::None, Compression::Gz, Compression::Zstd] {
+        for codec in [
+            Compression::None,
+            Compression::Gz,
+            Compression::Snappy,
+            Compression::Zstd,
+        ] {
             for framing in [ZstdFraming::Raw, ZstdFraming::HBaseBlock] {
                 let block = build_block(
                     BlockType::FileInfo,

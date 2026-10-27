@@ -42,6 +42,14 @@ fn column_index(batch: &RecordBatch, name: &str) -> Result<usize> {
         .map_err(|_| HFileError::InvalidArgument(format!("column '{name}' not found in input")))
 }
 
+/// The error for a non-empty input that produced no cells at all.
+pub(crate) fn no_cells_error(rows: usize) -> HFileError {
+    crate::error::corrupt_error(format!(
+        "no cells were produced from {rows} input rows: every value column was null, or the \
+         mapping skipped them all (check `row_key`, `family` and the timestamp column)"
+    ))
+}
+
 /// Convert record batches into sorted HBase cells.
 pub fn record_batches_to_cells(batches: &[RecordBatch], mapping: &Mapping) -> Result<Vec<Cell>> {
     let mut cells = Vec::new();
@@ -51,10 +59,7 @@ pub fn record_batches_to_cells(batches: &[RecordBatch], mapping: &Mapping) -> Re
         cells.extend(batch_to_cells(batch, mapping)?);
     }
     if cells.is_empty() && rows > 0 {
-        return corrupt(format!(
-            "no cells were produced from {rows} input rows: every value column was null, or the \
-             mapping skipped them all (check `row_key`, `family` and the timestamp column)"
-        ));
+        return Err(no_cells_error(rows));
     }
     cells.sort_by(compare_cells);
     Ok(cells)
@@ -144,7 +149,8 @@ fn raw_batch_to_cells(batch: &RecordBatch, mapping: &Mapping) -> Result<Vec<Cell
     Ok(out)
 }
 
-fn batch_to_cells(batch: &RecordBatch, mapping: &Mapping) -> Result<Vec<Cell>> {
+/// Convert one record batch into cells (used by [`crate::arrow::async_io`] as well).
+pub(crate) fn batch_to_cells(batch: &RecordBatch, mapping: &Mapping) -> Result<Vec<Cell>> {
     let schema = batch.schema();
     if is_raw_layout(&schema, mapping) {
         return raw_batch_to_cells(batch, mapping);

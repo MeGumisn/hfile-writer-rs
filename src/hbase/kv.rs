@@ -498,7 +498,12 @@ mod tests {
 
     #[test]
     fn cell_raw_roundtrip() {
-        let mut cell = Cell::new(b"row1".to_vec(), b"f".to_vec(), b"q".to_vec(), b"v".to_vec());
+        let mut cell = Cell::new(
+            b"row1".to_vec(),
+            b"f".to_vec(),
+            b"q".to_vec(),
+            b"v".to_vec(),
+        );
         cell.timestamp = 123456789;
         cell.seq_id = 42;
         for (tags, mvcc) in [(false, false), (true, false), (false, true), (true, true)] {

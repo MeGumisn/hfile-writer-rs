@@ -31,6 +31,8 @@ different `row_key_separator` (see [arrow-integration.md](arrow-integration.md#m
 | `--encoding` | `NONE` | `PREFIX` or `ROW_INDEX_V1` are usually better for bulk loads |
 | `--codec` | `none` | must match a codec the cluster can read |
 | `--zstd-framing` | `raw` | `raw` for Hadoop's codec, `hbase` for `hbase-compression-zstd` |
+| `--bloom` | `none` | `ROW` adds a bloom filter, useful when the table is read by row |
+| `--meta` | – | `NAME=VALUE`, repeatable; stored as a meta block |
 | `--block-size` | cluster default | target data block size in bytes |
 
 Result:

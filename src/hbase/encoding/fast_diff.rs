@@ -53,11 +53,7 @@ pub fn decode(body: &[u8], options: DecodeOptions) -> Result<Vec<Cell>> {
     Ok(cells)
 }
 
-fn decode_one(
-    cursor: &mut Cursor<'_>,
-    state: &mut State,
-    options: DecodeOptions,
-) -> Result<Cell> {
+fn decode_one(cursor: &mut Cursor<'_>, state: &mut State, options: DecodeOptions) -> Result<Cell> {
     let flag = cursor.u8()?;
     let first = state.key.is_empty();
 
@@ -104,8 +100,7 @@ fn decode_one(
                 row_with_size = state.row_length + 2;
                 key[2..row_with_size].copy_from_slice(cursor.take(state.row_length)?);
             } else {
-                key[common..row_with_size]
-                    .copy_from_slice(cursor.take(row_with_size - common)?);
+                key[common..row_with_size].copy_from_slice(cursor.take(row_with_size - common)?);
             }
             // The family is never stored again; copy it from the previous key.
             let family_len = state.family_len;
@@ -135,8 +130,7 @@ fn decode_one(
         }
         key[ts_pos..ts_pos + prefix_ts]
             .copy_from_slice(&prev_key[prev_ts_pos..prev_ts_pos + prefix_ts]);
-        key[ts_pos + prefix_ts..ts_pos + 8]
-            .copy_from_slice(cursor.take(8 - prefix_ts)?);
+        key[ts_pos + prefix_ts..ts_pos + 8].copy_from_slice(cursor.take(8 - prefix_ts)?);
 
         // Type and value.
         let cell_type = if flag & FLAG_SAME_TYPE != 0 {

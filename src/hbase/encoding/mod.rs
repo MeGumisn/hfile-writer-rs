@@ -112,9 +112,11 @@ pub fn decode_data_block(
     options: DecodeOptions,
 ) -> Result<Vec<Cell>> {
     match block_type {
-        BlockType::Data => {
-            Ok(parse_raw_cells(payload, options.includes_tags, options.includes_mvcc)?)
-        }
+        BlockType::Data => Ok(parse_raw_cells(
+            payload,
+            options.includes_tags,
+            options.includes_mvcc,
+        )?),
         BlockType::EncodedData => {
             if payload.len() < 2 {
                 return corrupt("encoded data block is too short to hold an encoding id");
@@ -169,7 +171,12 @@ impl BlockEncoder {
     }
 
     pub fn len(&self) -> usize {
-        self.buf.len() + if self.encoding == DataBlockEncoding::None { 0 } else { 6 }
+        self.buf.len()
+            + if self.encoding == DataBlockEncoding::None {
+                0
+            } else {
+                6
+            }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -227,8 +234,7 @@ impl BlockEncoder {
         match self.encoding {
             DataBlockEncoding::None => (BlockType::Data, self.buf),
             DataBlockEncoding::Prefix => {
-                let mut out =
-                    Vec::with_capacity(6 + self.buf.len());
+                let mut out = Vec::with_capacity(6 + self.buf.len());
                 out.extend_from_slice(&DataBlockEncoding::Prefix.id().to_be_bytes());
                 out.extend_from_slice(&(self.unencoded_size as i32).to_be_bytes());
                 out.extend_from_slice(&self.buf);
@@ -372,10 +378,7 @@ mod tests {
             assert_eq!(decoded[3].row, cells()[3].row);
             assert_eq!(decoded[3].value, cells()[3].value);
             assert_eq!(decoded[3].timestamp, cells()[3].timestamp);
-            assert_eq!(
-                decoded[3].seq_id,
-                if options.includes_mvcc { 3 } else { 0 }
-            );
+            assert_eq!(decoded[3].seq_id, if options.includes_mvcc { 3 } else { 0 });
         }
     }
 

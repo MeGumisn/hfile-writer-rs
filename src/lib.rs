@@ -28,5 +28,7 @@ pub mod error;
 pub mod hbase;
 
 pub use error::{HFileError, Result};
+pub use hbase::async_io::{AsyncHFileReader, AsyncHFileWriter};
+pub use hbase::bloom::{BloomOptions, BloomType};
 pub use hbase::reader::HFileReader;
 pub use hbase::writer::{HFileWriter, WriterOptions};

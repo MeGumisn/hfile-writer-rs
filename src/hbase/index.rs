@@ -73,7 +73,11 @@ pub fn search(entries: &[IndexEntry], key: &[u8]) -> Option<usize> {
             std::cmp::Ordering::Greater => hi = mid - 1,
         }
     }
-    if lo == 0 { None } else { Some((lo - 1) as usize) }
+    if lo == 0 {
+        None
+    } else {
+        Some((lo - 1) as usize)
+    }
 }
 
 /// Parse the root index block payload.

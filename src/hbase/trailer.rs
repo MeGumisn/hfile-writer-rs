@@ -156,9 +156,9 @@ impl FileTrailer {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let proto = self.to_proto();
         let mut pb = Vec::with_capacity(proto.encoded_len());
-        proto
-            .encode(&mut pb)
-            .map_err(|e| crate::error::corrupt_error(format!("failed to encode trailer protobuf: {e}")))?;
+        proto.encode(&mut pb).map_err(|e| {
+            crate::error::corrupt_error(format!("failed to encode trailer protobuf: {e}"))
+        })?;
         if NOT_PB_SIZE + pb.len() > TRAILER_SIZE {
             return corrupt(format!(
                 "trailer protobuf is too large ({} bytes)",

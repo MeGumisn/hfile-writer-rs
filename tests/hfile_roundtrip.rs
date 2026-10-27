@@ -2,11 +2,12 @@
 
 mod common;
 
-use common::{TempDir, cell_lines, sample_cells};
+use common::{TempDir, cell_lines, read_all, sample_cells};
+use hfile_rs::HFileError;
 use hfile_rs::hbase::file_info::keys;
 use hfile_rs::hbase::{
-    Cell, CellType, Compression, DataBlockEncoding, HFileReader, HFileWriter, WriterOptions,
-    ZstdFraming,
+    BloomOptions, Cell, CellType, Compression, DataBlockEncoding, HFileReader, HFileWriter,
+    WriterOptions, ZstdFraming,
 };
 use std::path::Path;
 
@@ -17,9 +18,10 @@ const ENCODINGS: [DataBlockEncoding; 3] = [
 ];
 
 /// Every codec/framing pair the writer supports.
-const CODECS: [(Compression, ZstdFraming); 4] = [
+const CODECS: [(Compression, ZstdFraming); 5] = [
     (Compression::None, ZstdFraming::Raw),
     (Compression::Gz, ZstdFraming::Raw),
+    (Compression::Snappy, ZstdFraming::Raw),
     (Compression::Zstd, ZstdFraming::Raw),
     (Compression::Zstd, ZstdFraming::HBaseBlock),
 ];
@@ -30,6 +32,40 @@ fn write(path: &Path, cells: &[Cell], options: WriterOptions) {
         .append_all(cells.iter().cloned())
         .expect("append cells");
     writer.finish().expect("finish file");
+}
+
+#[test]
+fn an_in_memory_sink_writes_a_readable_file_of_the_same_size() {
+    let dir = TempDir::new("sink");
+    let cells = sample_cells(37);
+    let options = WriterOptions {
+        block_size: 1024,
+        ..Default::default()
+    };
+
+    let mut writer =
+        HFileWriter::<Vec<u8>>::with_sink(Vec::new(), options.clone()).expect("sink writer");
+    assert!(writer.path().as_os_str().is_empty());
+    writer
+        .append_all(cells.iter().cloned())
+        .expect("append cells");
+    let bytes = writer.finish_into_sink().expect("finish into sink");
+
+    let path = dir.join("sink.hfile");
+    std::fs::write(&path, &bytes).expect("write sink bytes");
+    let reader = HFileReader::open(&path).expect("open sink file");
+    assert_eq!(reader.entry_count(), cells.len() as u64);
+    assert_eq!(
+        cell_lines(&reader.read_all().expect("read cells")),
+        cell_lines(&cells)
+    );
+
+    // Same layout as the file based writer; only the create timestamp inside the file info
+    // differs, and that is a fixed width i64.
+    let file_path = dir.join("file.hfile");
+    write(&file_path, &cells, options);
+    let from_file = std::fs::read(&file_path).expect("read file");
+    assert_eq!(from_file.len(), bytes.len());
 }
 
 #[test]
@@ -228,6 +264,160 @@ fn writing_diff_encodings_is_rejected() {
             encoding.name()
         );
     }
+}
+
+#[test]
+fn bloom_filter_round_trips_and_is_queried() {
+    let dir = TempDir::new("bloom");
+    let cells = sample_cells(40);
+    let path = dir.join("bloom.hfile");
+    write(
+        &path,
+        &cells,
+        WriterOptions {
+            bloom_filter: Some(BloomOptions::default()),
+            // Bloom chunks are ordinary compressed blocks.
+            compression: Compression::Gz,
+            block_size: 512,
+            ..Default::default()
+        },
+    );
+
+    let reader = HFileReader::open(&path).expect("open");
+    let filter = reader.bloom_filter().expect("file carries a bloom filter");
+    assert_eq!(filter.hash_count, 7);
+    assert_eq!(filter.chunks.len(), 1, "40 rows fit in one folded chunk");
+    assert_eq!(filter.total_key_count, 40);
+    assert_eq!(
+        reader.file_info().bloom_filter_type().as_deref(),
+        Some("ROW")
+    );
+
+    for row in 0..40 {
+        let row = format!("row{row:05}");
+        assert!(
+            reader.may_contain_row(row.as_bytes()).expect("query"),
+            "false negative for {row}"
+        );
+    }
+    // Sorts before the first key of the file.
+    assert!(!reader.may_contain_row(b"aaa").expect("query"));
+    // Rows after the file: mostly rejected, and never an error.
+    let false_positives = (0..500)
+        .filter(|i| {
+            reader
+                .may_contain_row(format!("zzz{i:04}").as_bytes())
+                .expect("query")
+        })
+        .count();
+    assert!(
+        false_positives < 50,
+        "{false_positives}/500 false positives"
+    );
+
+    // Every cell is still readable with the bloom chunks in the data section.
+    assert_eq!(read_all(&path), cells);
+}
+
+#[test]
+fn a_file_without_a_bloom_filter_answers_maybe() {
+    let dir = TempDir::new("no-bloom");
+    let path = dir.join("plain.hfile");
+    write(&path, &sample_cells(4), WriterOptions::default());
+
+    let reader = HFileReader::open(&path).expect("open");
+    assert!(reader.bloom_filter().is_none());
+    assert!(reader.file_info().bloom_filter_type().is_none());
+    assert!(reader.may_contain_row(b"anything").expect("query"));
+}
+
+#[test]
+fn meta_blocks_round_trip() {
+    let dir = TempDir::new("meta");
+    let cells = sample_cells(5);
+    let path = dir.join("meta.hfile");
+
+    let mut writer = HFileWriter::create(
+        &path,
+        WriterOptions {
+            // Deliberately out of order: the writer sorts them by name.
+            meta_blocks: vec![
+                ("meta-b".to_string(), b"second".to_vec()),
+                ("meta-a".to_string(), b"first".to_vec()),
+            ],
+            compression: Compression::Zstd,
+            includes_mvcc: true,
+            ..Default::default()
+        },
+    )
+    .expect("create writer");
+    writer.append_all(cells.iter().cloned()).expect("append");
+    writer
+        .append_meta_block("meta-c", b"third".to_vec())
+        .expect("append meta block");
+    writer.finish().expect("finish");
+
+    let reader = HFileReader::open(&path).expect("open");
+    let names: Vec<String> = reader
+        .meta_block_names()
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect();
+    assert_eq!(names, ["meta-a", "meta-b", "meta-c"]);
+    assert_eq!(reader.meta_block_count(), 3);
+    assert_eq!(reader.trailer().meta_index_count, 3);
+    assert_eq!(
+        reader.meta_block(b"meta-a").expect("read"),
+        Some(b"first".to_vec())
+    );
+    assert_eq!(
+        reader.meta_block(b"meta-c").expect("read"),
+        Some(b"third".to_vec())
+    );
+    assert_eq!(reader.meta_block(b"nope").expect("read"), None);
+    assert_eq!(read_all(&path), cells);
+}
+
+#[test]
+fn empty_and_repeated_meta_block_names() {
+    let dir = TempDir::new("meta-names");
+    let cells = sample_cells(3);
+    let path = dir.join("meta.hfile");
+
+    // An empty name is a caller error, and the file must not be created for it.
+    let rejected = HFileWriter::create(
+        &path,
+        WriterOptions {
+            meta_blocks: vec![(String::new(), b"x".to_vec())],
+            ..Default::default()
+        },
+    );
+    assert!(
+        matches!(rejected, Err(HFileError::InvalidArgument(_))),
+        "an empty meta block name must be rejected"
+    );
+    assert!(!path.exists(), "a rejected option must not create the file");
+
+    let mut writer = HFileWriter::create(&path, WriterOptions::default()).expect("create");
+    assert!(matches!(
+        writer.append_meta_block("", b"x".to_vec()),
+        Err(HFileError::InvalidArgument(_))
+    ));
+    writer.append_all(cells.iter().cloned()).expect("append");
+    writer
+        .append_meta_block("dup", b"first".to_vec())
+        .expect("first payload");
+    writer
+        .append_meta_block("dup", b"second".to_vec())
+        .expect("overwriting payload");
+    writer.finish().expect("finish");
+
+    let reader = HFileReader::open(&path).expect("open");
+    assert_eq!(reader.meta_block_count(), 1, "a repeated name is one block");
+    assert_eq!(
+        reader.meta_block(b"dup").expect("read"),
+        Some(b"second".to_vec()),
+        "the last payload wins"
+    );
 }
 
 #[test]
